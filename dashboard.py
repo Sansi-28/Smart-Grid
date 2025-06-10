@@ -116,44 +116,45 @@ with tab1:
 
     with col1:
         # Create the multi-layered chart
-        base = alt.Chart(forecast_df).encode(x=alt.X('timestamp:T', title='Time', axis=alt.Axis(format='%H:%M')))
+        base = alt.Chart(forecast_df).encode(
+            x=alt.X('timestamp:T', title='Time', axis=alt.Axis(format='%H:%M'))
+        )
 
         # Shaded bands for battery actions
         charge_band = alt.Chart(battery_df[battery_df['action'] == 'CHARGE']).mark_rect(opacity=0.3, color='#28a745').encode(
             x='timestamp:T',
-            x2='end_time:T'
+            x2='end_time:T',
+            tooltip=['timestamp:T', 'end_time:T', 'action:N', 'reason:N', 'battery_level_kwh:Q']
         )
         discharge_band = alt.Chart(battery_df[battery_df['action'] == 'DISCHARGE']).mark_rect(opacity=0.3, color='#ffc107').encode(
             x='timestamp:T',
-            x2='end_time:T'
+            x2='end_time:T',
+            tooltip=['timestamp:T', 'end_time:T', 'action:N', 'reason:N', 'battery_level_kwh:Q']
         )
 
         # Main forecast lines
         load_line = base.mark_line(color='#00A9E0', strokeWidth=3).encode(
-            y=alt.Y('load_kw:Q', title='Power (kW)')
+            y=alt.Y('load_kw:Q', title='Power (kW)'),
+            tooltip=['timestamp:T', 'load_kw:Q']
         )
-        
         solar_area = base.mark_area(color='#28a745', opacity=0.5).encode(
-            y='solar_kw:Q'
+            y=alt.Y('solar_kw:Q', title='Solar Generation (kW)'),
+            tooltip=['timestamp:T', 'solar_kw:Q']
         )
-        
-        # Create a separate chart for price with its own y-axis
-        price_chart = alt.Chart(forecast_df).encode(
-            x=alt.X('timestamp:T', title='Time'),
-            y=alt.Y('price:Q', title='Price ($/kWh)', axis=alt.Axis(titleColor='#ffc107'))
-        ).mark_line(color='#ffc107', strokeDash=[5,5])
+        price_line = base.mark_line(color='#ffc107', strokeDash=[5,5]).encode(
+            y=alt.Y('price:Q', title='Price ($/kWh)', axis=alt.Axis(titleColor='#ffc107')),
+            tooltip=['timestamp:T', 'price:Q']
+        )
 
         # Combine all layers
         final_chart = alt.layer(
-            charge_band, discharge_band, load_line, solar_area
+            charge_band, discharge_band, load_line, solar_area, price_line
         ).resolve_scale(
             y='independent'
+        ).properties(
+            title='24-Hour Energy Forecast',
+            height=400
         ).interactive()
-        
-        # Add price chart as a separate layer
-        final_chart = alt.layer(final_chart, price_chart).resolve_scale(
-            y='independent'
-        )
         
         st.altair_chart(final_chart, use_container_width=True)
 

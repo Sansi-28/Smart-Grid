@@ -1,15 +1,13 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from typing import List, Dict, Optional, Any
+from pydantic import BaseModel
 import pandas as pd
 import pickle
 import os
 from datetime import datetime, timedelta
 import numpy as np
+from typing import List, Optional, Dict
 import logging
-import json
-import joblib
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -26,7 +24,7 @@ solar_features = [
 ]
 
 price_features = [
-    'hour', 'dayofweek', 'power_kw'
+    'hour', 'dayofweek', 'load_kw'
 ]
 
 fault_features = [
@@ -185,98 +183,72 @@ price_model_obj = load_model('price_forecaster.pkl')
 fault_model_obj = load_model('fault_predictor.pkl')  # New model
 
 # --- Pydantic Data Models (Final Version) ---
-class SystemVitals(BaseModel):
-    """Real-time system vitals"""
-    timestamp: str
-    voltage: float = Field(..., description="Current voltage in volts")
-    current: float = Field(..., description="Current in amperes")
-    power_factor: float = Field(..., description="Power factor")
-    temperature: float = Field(..., description="Temperature in Celsius")
-    humidity: float = Field(..., description="Humidity percentage")
-    grid_power: float = Field(..., description="Current grid power in kW")
-    solar_power: float = Field(..., description="Current solar generation in kW")
-    battery_power: float = Field(..., description="Current battery power in kW")
-    battery_soc: float = Field(..., description="Battery state of charge percentage")
-    load_power: float = Field(..., description="Current load power in kW")
-    grid_price: float = Field(..., description="Current grid price in $/kWh")
-
 class Forecast(BaseModel):
-    """Energy forecast data point"""
     timestamp: str
-    predicted_load: float = Field(..., description="Predicted load in kW")
-    solar_power: float = Field(..., description="Predicted solar generation in kW")
-    grid_supply: float = Field(..., description="Predicted grid supply in kW")
-    price: float = Field(..., description="Predicted price in $/kWh")
-    net_load_kw: float = Field(..., description="Net load (load - solar) in kW")
+    load_kw: float
+    solar_kw: float
+    price: float
+    net_load_kw: float
 
 class BatteryAction(BaseModel):
-    """Battery optimization action"""
     timestamp: str
-    action: str  # 'charge' or 'discharge'
-    power: float
-    start_time: str
-    end_time: str
-    confidence: float
+    action: str  # "CHARGE", "DISCHARGE", "HOLD"
+    reason: str
+    battery_level_kwh: float
+    end_time: str  # Added for visualization bands
 
 class MaintenanceAlert(BaseModel):
-    """Maintenance alert"""
     timestamp: str
-    component: str = Field(..., description="Component requiring maintenance")
-    severity: str = Field(..., description="Severity level: 'critical', 'warning', or 'info'")
-    description: str = Field(..., description="Alert description")
-    probability: float = Field(..., description="Probability of failure (0-1)")
-    recommended_action: str = Field(..., description="Recommended maintenance action")
-    impact: str = Field(..., description="Potential impact if not addressed")
-    evidence: Dict[str, Any] = Field(..., description="Supporting evidence for the alert")
-
-class SystemAnalytics(BaseModel):
-    """System analytics and metrics"""
-    timestamp: str
-    daily_stats: Dict[str, float] = Field(..., description="Daily statistics")
-    weekly_stats: Dict[str, float] = Field(..., description="Weekly statistics")
-    monthly_stats: Dict[str, float] = Field(..., description="Monthly statistics")
-    cost_metrics: Dict[str, float] = Field(..., description="Cost-related metrics")
-    efficiency_metrics: Dict[str, float] = Field(..., description="Efficiency metrics")
-    reliability_metrics: Dict[str, float] = Field(..., description="Reliability metrics")
-    environmental_metrics: Dict[str, float] = Field(..., description="Environmental impact metrics")
+    priority: str  # "CRITICAL", "HIGH", "MEDIUM", "LOW"
+    message: str
+    fault_probability: float
+    evidence: Optional[Dict[str, float]] = None  # Added for detailed diagnostics
 
 class SystemStatus(BaseModel):
-    """Complete system status response"""
     timestamp: str
-    forecasts: List[Forecast]
+    forecasts: List[Forecast]  # Changed to match new dashboard expectations
     battery_schedule: List[BatteryAction]
     maintenance_alerts: List[MaintenanceAlert]
     system_health: float
-    live_vitals: Dict[str, float] = Field(default_factory=dict)
-    analytics_data: Dict[str, Any] = Field(default_factory=dict)
+    component_vitals: Optional[Dict[str, List[float]]] = None  # Added for future use
 
 # --- Prescriptive Logic (Battery and Maintenance) ---
-def generate_battery_schedule(df: pd.DataFrame) -> List[BatteryAction]:
+def generate_battery_schedule(forecast_df):
     schedule = []
-    for index, row in df.iterrows():
-        net_load = row['power_kw'] - row['solar_power']
-        price = row['price']
+    BATTERY_CAPACITY_KWH = 500.0
+    BATTERY_MAX_CHARGE_RATE_KW = 150.0
+    BATTERY_MAX_DISCHARGE_RATE_KW = 150.0
+    current_battery_level = BATTERY_CAPACITY_KWH / 2.0
+    price_25th = forecast_df['price'].quantile(0.25)
+    price_75th = forecast_df['price'].quantile(0.75)
+
+    for index, row in forecast_df.iterrows():
+        action = "HOLD"
+        reason = "Default action"
+        end_time = index + timedelta(minutes=15)  # 15-minute intervals
         
-        # Simple battery optimization logic
-        if price > 0.5 and net_load > 0:  # High price, high load - discharge
-            action = "discharge"
-            power = min(net_load, 5.0)  # Max 5kW discharge
-        elif price < 0.3 and net_load < 0:  # Low price, excess solar - charge
-            action = "charge"
-            power = min(abs(net_load), 5.0)  # Max 5kW charge
-        else:
-            action = "idle"
-            power = 0.0
-            
-        end_time = (pd.to_datetime(index) + pd.Timedelta(hours=1)).isoformat()
+        if row['price'] <= price_25th and current_battery_level < BATTERY_CAPACITY_KWH:
+            action = "CHARGE"
+            reason = f"Price is low (${row['price']:.2f})"
+            charge_amount = min(BATTERY_MAX_CHARGE_RATE_KW * 0.25, BATTERY_CAPACITY_KWH - current_battery_level)
+            current_battery_level += charge_amount
+        elif row['price'] >= price_75th and current_battery_level > 0:
+            action = "DISCHARGE"
+            reason = f"Price is high (${row['price']:.2f})"
+            discharge_amount = min(BATTERY_MAX_DISCHARGE_RATE_KW * 0.25, current_battery_level)
+            current_battery_level -= discharge_amount
+        elif row['net_load_kw'] < 0 and current_battery_level < BATTERY_CAPACITY_KWH:
+            action = "CHARGE"
+            reason = f"Absorbing excess solar ({-row['net_load_kw']:.2f} kW)"
+            charge_amount = min(-row['net_load_kw'] * 0.25, BATTERY_MAX_CHARGE_RATE_KW * 0.25, BATTERY_CAPACITY_KWH - current_battery_level)
+            current_battery_level += charge_amount
         
         schedule.append(BatteryAction(
             timestamp=str(index),
             action=action,
-            power=float(power),
-            start_time=str(index),
-            end_time=end_time,
-            confidence=0.9
+            reason=reason,
+            battery_level_kwh=current_battery_level,
+            end_time=str(end_time)
         ))
     return schedule
 
@@ -316,116 +288,117 @@ def generate_maintenance_alerts(fault_probabilities, forecast_df):
 async def get_system_status():
     """Get current system status including load forecasts and fault predictions."""
     try:
-        # Load models
-        logger.info("Loading models...")
-        load_model = joblib.load('app/models/load_forecaster.pkl')
-        solar_model = joblib.load('app/models/solar_forecaster.pkl')
-        price_model = joblib.load('app/models/price_forecaster.pkl')
-        fault_model = joblib.load('app/models/fault_predictor.pkl')
-        logger.info("All models loaded successfully")
+        # Load the trained models
+        try:
+            logger.info("Loading models...")
+            load_model_obj = load_model('load_forecaster.pkl')
+            solar_model_obj = load_model('solar_forecaster.pkl')
+            price_model_obj = load_model('price_forecaster.pkl')
+            fault_model_obj = load_model('fault_predictor.pkl')
+            logger.info("All models loaded successfully")
+        except Exception as e:
+            logger.error(f"Error loading models: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error loading models: {str(e)}")
         
-        # Create feature DataFrame
-        logger.info("Creating feature DataFrame...")
+        # Create future timestamps (next 24 hours)
         future_timestamps = pd.date_range(
             start=pd.Timestamp.now(),
             periods=24,
-            freq='H'
+            freq='h'
         )
         
+        # Create a DataFrame for future predictions with all required features
         future_df = pd.DataFrame(index=future_timestamps)
+        
+        # Add all features needed for predictions with exact names matching training
+        logger.info("Creating feature DataFrame...")
+        future_df['Voltage (V)'] = 230.0
+        future_df['Current (A)'] = 100.0
+        future_df['power_kw'] = 50.0
+        future_df['Reactive Power (kVAR)'] = 20.0
+        future_df['Power Factor'] = 0.95
+        future_df['Temperature (°C)'] = 25.0
+        future_df['voltage_fluctuation'] = 0.02
+        
+        # Add time-based features needed for load and solar predictions
         future_df['hour'] = future_df.index.hour
         future_df['dayofweek'] = future_df.index.dayofweek
         future_df['month'] = future_df.index.month
         future_df['year'] = future_df.index.year
         future_df['dayofyear'] = future_df.index.dayofyear
+        future_df['Humidity (%)'] = 50.0
         
-        # Add static features (using last known values)
-        future_df['Voltage (V)'] = 230.0  # Nominal voltage
-        future_df['Current (A)'] = 10.0   # Nominal current
-        future_df['power_kw'] = 2.0       # Base load
-        future_df['Reactive Power (kVAR)'] = 0.5
-        future_df['Power Factor'] = 0.95
-        future_df['Temperature (°C)'] = 25.0
-        future_df['voltage_fluctuation'] = 0.02
-        future_df['Humidity (%)'] = 60.0
-        
+        # Log available features
         logger.info(f"Available features: {future_df.columns.tolist()}")
         
-        # Make predictions
-        logger.info("Making load predictions...")
-        load_forecast = load_model.predict(future_df[load_features])
-        logger.info("Load predictions completed")
+        # Verify all required features are present
+        missing_features = set(fault_features) - set(future_df.columns)
+        if missing_features:
+            error_msg = f"Missing features in DataFrame: {missing_features}"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
         
-        logger.info("Making solar predictions...")
-        solar_forecast = solar_model.predict(future_df[solar_features])
-        logger.info("Solar predictions completed")
+        # Make predictions with error handling for each model
+        try:
+            logger.info("Making load predictions...")
+            load_forecast = load_model_obj.predict(future_df[load_features])
+            logger.info("Load predictions completed")
+            
+            # Add load_kw to the DataFrame for price prediction
+            future_df['load_kw'] = load_forecast
+        except Exception as e:
+            logger.error(f"Error in load prediction: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error in load prediction: {str(e)}")
+            
+        try:
+            logger.info("Making solar predictions...")
+            solar_forecast = solar_model_obj.predict(future_df[solar_features])
+            logger.info("Solar predictions completed")
+            future_df['solar_kw'] = solar_forecast
+        except Exception as e:
+            logger.error(f"Error in solar prediction: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error in solar prediction: {str(e)}")
+            
+        try:
+            logger.info("Making price predictions...")
+            price_forecast = price_model_obj.predict(future_df[price_features])
+            logger.info("Price predictions completed")
+            future_df['price'] = price_forecast
+        except Exception as e:
+            logger.error(f"Error in price prediction: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error in price prediction: {str(e)}")
         
-        logger.info("Making price predictions...")
-        price_forecast = price_model.predict(future_df[price_features])
-        logger.info("Price predictions completed")
-        
-        # Update DataFrame with predictions
-        future_df = future_df.copy()
-        future_df['power_kw'] = load_forecast
-        future_df['solar_power'] = solar_forecast
-        future_df['price'] = price_forecast
-        
-        # Generate battery schedule
-        logger.info("Generating battery schedule...")
-        battery_schedule = generate_battery_schedule(future_df)
-        logger.info("Battery schedule generated")
+        # Calculate net load for battery optimization
+        future_df['net_load_kw'] = future_df['load_kw'] - future_df['solar_kw']
         
         # Create forecasts list
-        logger.info("Creating forecasts...")
         forecasts = []
-        for i, ts in enumerate(future_df.index):
+        for i, ts in enumerate(future_timestamps):
             forecasts.append(Forecast(
                 timestamp=str(ts),
-                predicted_load=float(load_forecast[i]),
-                grid_supply=float(load_forecast[i] - solar_forecast[i]),
-                solar_power=float(solar_forecast[i]),
+                load_kw=float(load_forecast[i]),
+                solar_kw=float(solar_forecast[i]),
                 price=float(price_forecast[i]),
                 net_load_kw=float(load_forecast[i] - solar_forecast[i])
             ))
-        logger.info("Forecasts created")
         
-        # Generate maintenance alerts
-        logger.info("Making fault predictions...")
-        fault_probabilities = fault_model.predict_proba(future_df[fault_features])[:, 1]
-        logger.info("Fault predictions completed")
+        # Generate battery schedule
+        battery_schedule = generate_battery_schedule(future_df)
         
-        maintenance_alerts = []
-        for i, ts in enumerate(future_df.index):
-            if fault_probabilities[i] > 0.7:
-                maintenance_alerts.append(MaintenanceAlert(
-                    timestamp=str(ts),
-                    component="Grid",
-                    severity="high",
-                    description="High probability of grid instability",
-                    evidence={
-                        "fault_probability": float(fault_probabilities[i]),
-                        "voltage": float(future_df.iloc[i]['Voltage (V)']),
-                        "current": float(future_df.iloc[i]['Current (A)'])
-                    }
-                ))
+        # Make fault predictions
+        try:
+            logger.info("Making fault predictions...")
+            fault_probabilities = fault_model_obj.predict_proba(future_df[fault_features])[:, 1]
+            logger.info("Fault predictions completed")
+        except Exception as e:
+            logger.error(f"Error in fault prediction: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error in fault prediction: {str(e)}")
+        
+        # Create maintenance alerts based on fault probabilities
+        maintenance_alerts = generate_maintenance_alerts(list(fault_probabilities), future_df)
         
         # Calculate system health score
-        health_score = 1.0 - np.mean(fault_probabilities)
-        
-        # Create live vitals and analytics data
-        live_vitals = {
-            "voltage": float(future_df.iloc[-1]['Voltage (V)']),
-            "current": float(future_df.iloc[-1]['Current (A)']),
-            "power": float(future_df.iloc[-1]['power_kw']),
-            "temperature": float(future_df.iloc[-1]['Temperature (°C)'])
-        }
-        
-        analytics_data = {
-            "peak_load": float(np.max(load_forecast)),
-            "avg_price": float(np.mean(price_forecast)),
-            "solar_generation": float(np.sum(solar_forecast)),
-            "battery_cycles": len([a for a in battery_schedule if a.action != "idle"])
-        }
+        health_score = 100 - (fault_probabilities.mean() * 100)
         
         logger.info("Successfully generated all predictions and alerts")
         
@@ -434,184 +407,11 @@ async def get_system_status():
             forecasts=forecasts,
             battery_schedule=battery_schedule,
             maintenance_alerts=maintenance_alerts,
-            system_health=float(health_score),
-            live_vitals=live_vitals,
-            analytics_data=analytics_data
+            system_health=health_score
         )
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Unexpected error in get_system_status: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Enhanced API Models
-class ContributingFactor(BaseModel):
-    feature: str
-    importance: float
-
-class LiveVitals(BaseModel):
-    voltage: float
-    current: float
-    power_factor: float
-    grid_supply: float
-    solar_power: float
-    wind_power: Optional[float] = 0.0
-
-class Forecast(BaseModel):
-    timestamp: datetime
-    predicted_load: float
-    grid_supply: float
-    solar_power: float
-    price: float
-
-class BatteryAction(BaseModel):
-    timestamp: datetime
-    action: str
-    reason: str
-    power: Optional[float] = None
-
-class AnalyticsData(BaseModel):
-    load_heatmap: List[Dict[str, float]]
-    correlation_matrix: Dict[str, Dict[str, float]]
-
-class SystemStatus(BaseModel):
-    timestamp: datetime
-    live_vitals: LiveVitals
-    forecasts: List[Forecast]
-    battery_schedule: List[BatteryAction]
-    maintenance_alerts: List[MaintenanceAlert]
-    analytics_data: AnalyticsData
-    system_health: float
-
-def generate_analytics_data(df: pd.DataFrame) -> AnalyticsData:
-    """Generate analytics data including heatmap and correlation matrix."""
-    # Create load heatmap data
-    df['hour'] = pd.to_datetime(df['timestamp']).dt.hour
-    df['dayofweek'] = pd.to_datetime(df['timestamp']).dt.dayofweek
-    heatmap_data = df.groupby(['hour', 'dayofweek'])['power_kw'].mean().reset_index()
-    
-    # Create correlation matrix
-    numeric_cols = ['power_kw', 'solar_kw', 'price', 'voltage', 'current', 'power_factor']
-    corr_matrix = df[numeric_cols].corr()
-    
-    return AnalyticsData(
-        load_heatmap=heatmap_data.to_dict('records'),
-        correlation_matrix=corr_matrix.to_dict()
-    )
-
-def get_contributing_factors(fault_prob: float, features: Dict[str, float]) -> List[ContributingFactor]:
-    """Generate contributing factors for maintenance alerts."""
-    # Sort features by their absolute values
-    sorted_features = sorted(features.items(), key=lambda x: abs(x[1]), reverse=True)
-    total_importance = sum(abs(v) for v in features.values())
-    
-    return [
-        ContributingFactor(
-            feature=k,
-            importance=abs(v) / total_importance
-        )
-        for k, v in sorted_features[:3]  # Top 3 contributing factors
-    ]
-
-@app.get("/api/v3/system-status", response_model=SystemStatus)
-async def get_system_status():
-    try:
-        # Get current timestamp
-        current_time = datetime.now()
-        
-        # Generate forecast data
-        forecast_hours = pd.date_range(start=current_time, periods=24, freq='H')
-        forecast_data = []
-        
-        for timestamp in forecast_hours:
-            # Create features for prediction
-            features = {
-                'hour': timestamp.hour,
-                'dayofweek': timestamp.dayofweek,
-                'month': timestamp.month,
-                'year': timestamp.year,
-                'dayofyear': timestamp.dayofyear,
-                'Temperature (°C)': 25.0,  # Example temperature
-                'Humidity (%)': 60.0,      # Example humidity
-                'power_kw': 3000.0         # Example load
-            }
-            
-            # Make predictions
-            load_pred = load_model_obj.predict(pd.DataFrame([features]))[0]
-            solar_pred = solar_model_obj.predict(pd.DataFrame([features]))[0]
-            price_pred = price_model_obj.predict(pd.DataFrame([features]))[0]
-            
-            forecast_data.append(Forecast(
-                timestamp=timestamp,
-                predicted_load=load_pred,
-                grid_supply=max(0, load_pred - solar_pred),
-                solar_power=solar_pred,
-                price=price_pred
-            ))
-        
-        # Generate battery schedule
-        battery_schedule = []
-        for forecast in forecast_data:
-            if forecast.price < 0.1:  # Low price period
-                battery_schedule.append(BatteryAction(
-                    timestamp=forecast.timestamp,
-                    action="CHARGE",
-                    reason="Low electricity price"
-                ))
-            elif forecast.price > 0.2 and forecast.predicted_load > 4000:  # High price and high load
-                battery_schedule.append(BatteryAction(
-                    timestamp=forecast.timestamp,
-                    action="DISCHARGE",
-                    reason="High demand and price"
-                ))
-        
-        # Generate maintenance alerts
-        maintenance_alerts = []
-        current_features = {
-            'voltage': 239.5,
-            'current': 150.2,
-            'power_kw': 3500.0,
-            'power_factor': 0.98,
-            'voltage_fluctuation': 0.02
-        }
-        
-        fault_prob = fault_model_obj.predict_proba(pd.DataFrame([current_features]))[0][1]
-        if fault_prob > 0.8:
-            maintenance_alerts.append(MaintenanceAlert(
-                priority="CRITICAL",
-                message="Immediate inspection required on Transformer 4B",
-                fault_probability=fault_prob,
-                contributing_factors=get_contributing_factors(fault_prob, current_features)
-            ))
-        elif fault_prob > 0.6:
-            maintenance_alerts.append(MaintenanceAlert(
-                priority="HIGH",
-                message="Schedule maintenance for Transformer 4B",
-                fault_probability=fault_prob,
-                contributing_factors=get_contributing_factors(fault_prob, current_features)
-            ))
-        
-        # Generate live vitals
-        live_vitals = LiveVitals(
-            voltage=current_features['voltage'],
-            current=current_features['current'],
-            power_factor=current_features['power_factor'],
-            grid_supply=current_features['power_kw'],
-            solar_power=forecast_data[0].solar_power
-        )
-        
-        # Generate analytics data
-        df = pd.read_csv('data/smart_grid_data.csv')
-        analytics_data = generate_analytics_data(df)
-        
-        return SystemStatus(
-            timestamp=current_time,
-            live_vitals=live_vitals,
-            forecasts=forecast_data,
-            battery_schedule=battery_schedule,
-            maintenance_alerts=maintenance_alerts,
-            analytics_data=analytics_data,
-            system_health=1.0 - max([alert.fault_probability for alert in maintenance_alerts] + [0.0])
-        )
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) 
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}") 
